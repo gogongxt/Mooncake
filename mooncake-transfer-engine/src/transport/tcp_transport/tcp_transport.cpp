@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <random>
 
@@ -36,7 +37,17 @@
 
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
-const static size_t kDefaultBufferSize = 65536;
+static size_t getChunkSize() {
+    static const size_t val = [] {
+        const char* env = std::getenv("MC_TCP_CHUNK_SIZE");
+        if (env) {
+            size_t v = std::stoull(env);
+            if (v > 0) return v;
+        }
+        return size_t(65536);  // 64KB default
+    }();
+    return val;
+}
 
 struct SessionHeader {
     uint64_t size;
@@ -113,7 +124,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         char* addr = local_buffer_;
 
         size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
+            std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             session_mutex_.unlock();
             // Transfer complete, wait for next request on this connection
@@ -177,7 +188,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         char* addr = local_buffer_;
 
         size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
+            std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             session_mutex_.unlock();
             // Transfer complete, wait for next request on this connection
@@ -298,7 +309,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         char* addr = local_buffer_;
 
         size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
+            std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
             session_mutex_.unlock();
@@ -370,7 +381,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         char* addr = local_buffer_;
 
         size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
+            std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
             session_mutex_.unlock();
