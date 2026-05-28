@@ -47,12 +47,15 @@ struct SessionHeader {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-static bool isCudaMemory(void* addr) {
+// Returns the CUDA device ordinal if addr is device memory, or -1 otherwise.
+// Uses cudaPointerGetAttributes which requires a current CUDA context; callers
+// must call cudaSetDevice before any cudaMemcpy to avoid implicit GPU0 init.
+static int getCudaDevice(void* addr) {
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
-    if (status != cudaSuccess) return false;
-    if (attributes.type == cudaMemoryTypeDevice) return true;
-    return false;
+    if (status != cudaSuccess) return -1;
+    if (attributes.type == cudaMemoryTypeDevice) return attributes.device;
+    return -1;
 }
 #endif
 
@@ -119,12 +122,15 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
+        int cuda_device = -1;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        if (isCudaMemory(addr)) {
+        cuda_device = getCudaDevice(addr);
+        if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
+            cudaSetDevice(cuda_device);
             cudaError_t cuda_status =
                 cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
                            buffer_size, cudaMemcpyDefault);
@@ -141,12 +147,12 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, self](const asio::error_code& ec,
-                                            std::size_t transferred_bytes) {
+            [this, addr, dram_buffer, cuda_device, self](
+                const asio::error_code& ec, std::size_t transferred_bytes) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (isCudaMemory(addr)) {
+                if (cuda_device >= 0) {
                     delete[] dram_buffer;
                 }
 #endif
@@ -180,21 +186,20 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
+        int cuda_device = -1;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        bool is_cuda_memory = isCudaMemory(addr);
-        if (is_cuda_memory) {
+        cuda_device = getCudaDevice(addr);
+        if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
         }
-#else
-        bool is_cuda_memory = false;
 #endif
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, is_cuda_memory, self](
+            [this, addr, dram_buffer, cuda_device, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
                     // If client closed connection (EOF), this is normal - don't
@@ -209,18 +214,15 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << " (value: " << ec.value() << ")";
                     }
                     session_mutex_.unlock();
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                    if (is_cuda_memory) delete[] dram_buffer;
-#endif
+                    if (cuda_device >= 0) delete[] dram_buffer;
                     return;  // Connection will be closed
                 }
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (is_cuda_memory) {
+                if (cuda_device >= 0) {
+                    cudaSetDevice(cuda_device);
                     cudaError_t cuda_status =
                         cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
                                    transferred_bytes, cudaMemcpyDefault);
@@ -305,21 +307,20 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
+        int cuda_device = -1;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        bool is_cuda_memory = isCudaMemory(addr);
-        if (is_cuda_memory) {
+        cuda_device = getCudaDevice(addr);
+        if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
         }
-#else
-        bool is_cuda_memory = false;
 #endif
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, is_cuda_memory, self](
+            [this, addr, dram_buffer, cuda_device, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
@@ -330,11 +331,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " (value: " << ec.value() << ")";
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     if (on_complete_) on_complete_();
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                    if (is_cuda_memory) delete[] dram_buffer;
-#endif
+                    if (cuda_device >= 0) delete[] dram_buffer;
                     session_mutex_.unlock();
                     return;
                 }
@@ -342,7 +339,8 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (is_cuda_memory) {
+                if (cuda_device >= 0) {
+                    cudaSetDevice(cuda_device);
                     cudaError_t cuda_status =
                         cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
                                    transferred_bytes, cudaMemcpyDefault);
@@ -381,12 +379,15 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
+        int cuda_device = -1;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        if (isCudaMemory(addr)) {
+        cuda_device = getCudaDevice(addr);
+        if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
+            cudaSetDevice(cuda_device);
             cudaError_t cuda_status =
                 cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
                            buffer_size, cudaMemcpyDefault);
@@ -405,15 +406,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, self](const asio::error_code& ec,
-                                            std::size_t transferred_bytes) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                if (isCudaMemory(addr)) {
+            [this, addr, dram_buffer, cuda_device, self](
+                const asio::error_code& ec, std::size_t transferred_bytes) {
+                if (cuda_device >= 0) {
                     delete[] dram_buffer;
                 }
-#endif
                 if (ec) {
                     LOG(ERROR)
                         << "ClientSession::writeBody failed. "
