@@ -1,0 +1,181 @@
+name: 'Build TENT CUDA Wheels (fork only)'
+
+# Fork-only workflow: builds the official CUDA wheel profile with TENT enabled
+# (-DUSE_TENT=ON), which upstream release wheels do not include. Mirrors
+# .github/workflows/_build-wheel.yaml (cuda:x86_64) so it cannot drift from
+# the official release path.
+
+on:
+  workflow_dispatch:
+    inputs:
+      python-versions:
+        description: 'Python versions (JSON list)'
+        required: false
+        default: '["3.10", "3.11", "3.12", "3.13"]'
+      version:
+        description: 'Wheel version (PEP 440)'
+        required: false
+        default: '0.3.13.post1'
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    # Same image as the official cuda:x86_64 wheel build.
+    container: pytorch/manylinux2_28-builder:cuda12.8
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    env:
+      BUILD_ARCHITECTURE: x86_64
+      BUILD_VARIANT: cuda
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory '*'
+
+      - name: Configure build profile
+        shell: bash
+        run: |
+          # Official cuda:x86_64 profile from _build-wheel.yaml, plus USE_TENT.
+          echo "TORCH_CUDA_ARCH_LIST=8.0;9.0" >> "$GITHUB_ENV"
+          echo "EP_TORCH_VERSIONS_INPUT=2.11.0;2.12.0;2.12.1;2.13.0;2.14.0" >> "$GITHUB_ENV"
+          echo "BUILD_NVLINK_ALLOCATOR=true" >> "$GITHUB_ENV"
+          echo "CMAKE_ARGS=-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DUSE_TENT=ON" >> "$GITHUB_ENV"
+
+      - name: Set version
+        run: echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+
+      - name: Patch wheel version in pyproject.toml
+        run: |
+          sed -i "s/^version = .*/version = \"$VERSION\"/" mooncake-wheel/pyproject.toml
+          echo "Patched mooncake-wheel/pyproject.toml version to: $VERSION"
+
+      - name: Select Python ${{ matrix.python-version }} from manylinux image
+        run: |
+          PYV_NODOT=$(echo "${{ matrix.python-version }}" | tr -d '.')
+          PYBIN="/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure project
+        run: |
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+          if [ -n "$SUDO" ] && command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -y || true
+          fi
+          $SUDO bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          mkdir -p build && cd build
+          # shellcheck disable=SC2086
+          cmake .. $CMAKE_ARGS -DEP_TORCH_VERSIONS="$EP_TORCH_VERSIONS_INPUT" -DPython3_EXECUTABLE="$(which python3)"
+
+      - name: Build project
+        env:
+          # Bound the nested Ninja build used by torch.utils.cpp_extension.
+          MAX_JOBS: "2"
+        run: |
+          for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
+            [ -d "$dir" ] && export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"
+          done
+          [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -E"
+          cd build
+          cmake --build . -j"$(nproc)"
+          $SUDO cmake --install .
+
+      - name: Build nvlink_allocator.so
+        run: |
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          if [ -d /usr/local/cuda/lib64/stubs ]; then
+            export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}"
+            export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}"
+          fi
+          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+          cd mooncake-transfer-engine/nvlink-allocator
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+
+      - name: Run sccache stat for check
+        if: ${{ env.SCCACHE_PATH != '' }}
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Generate Python version tag
+        id: pytag
+        run: echo "tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
+
+      - name: Build Python wheel
+        run: |
+          [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+          PYTHON_VERSION="${{ matrix.python-version }}" \
+          OUTPUT_DIR="dist-py${{ steps.pytag.outputs.tag }}" \
+            ./scripts/build_wheel.sh
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Smoke test repaired wheel
+        shell: bash
+        run: |
+          smoke_venv=$(mktemp -d)
+          python -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --no-deps \
+            mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl
+
+          # TENT must actually be inside the wheel.
+          wheel=$(ls mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl)
+          if ! unzip -l "$wheel" | grep -q "libtent_metrics"; then
+            echo "::error::TENT runtime (libtent_metrics.so) missing from wheel"
+            exit 1
+          fi
+
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          for dir in /usr/local/cuda/lib64 \
+                     /usr/local/cuda/lib64/stubs \
+                     /usr/local/cuda/targets/*/lib \
+                     /usr/local/cuda/targets/*/lib/stubs; do
+            [ -d "$dir" ] && export LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH"
+          done
+          cuda_stub=
+          for candidate in /usr/local/cuda/lib64/stubs/libcuda.so \
+                           /usr/local/cuda/targets/*/lib/stubs/libcuda.so; do
+            if [ -f "$candidate" ]; then
+              cuda_stub="$candidate"
+              break
+            fi
+          done
+          if [ -n "$cuda_stub" ]; then
+            ln -s "$cuda_stub" "$smoke_venv/libcuda.so.1"
+            export LD_LIBRARY_PATH="$smoke_venv:$LD_LIBRARY_PATH"
+          fi
+
+          "$smoke_venv/bin/mooncake_master" --version
+
+          # MC_USE_TENT=1 import smoke: engine.so with the TENT runtime linked.
+          "$smoke_venv/bin/python" - <<'EOF'
+          import os
+          os.environ["MC_USE_TENT"] = "1"
+          from mooncake.engine import TransferEngine
+          print("MC_USE_TENT import OK")
+          EOF
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tent-wheel-py${{ steps.pytag.outputs.tag }}
+          path: mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl
