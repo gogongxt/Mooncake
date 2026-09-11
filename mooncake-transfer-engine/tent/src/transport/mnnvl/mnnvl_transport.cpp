@@ -28,6 +28,17 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <sys/syscall.h>
+// Older glibc (manylinux2_28 / pre-2.34) headers predate the pidfd
+// syscalls (Linux 5.3/5.6). The numbers below are shared by 64-bit
+// architectures (asm-generic/unistd.h).
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
+
 #include "tent/common/status.h"
 #include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
