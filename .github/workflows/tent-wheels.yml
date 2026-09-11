@@ -16,6 +16,15 @@ on:
         description: 'Wheel version (PEP 440)'
         required: false
         default: '0.3.13.post1'
+      publish:
+        description: 'Publish wheels to a GitHub release after building'
+        type: boolean
+        required: false
+        default: false
+      tag:
+        description: 'Release tag when publishing (default: v<version>)'
+        required: false
+        default: ''
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -179,3 +188,51 @@ jobs:
         with:
           name: tent-wheel-py${{ steps.pytag.outputs.tag }}
           path: mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl
+
+  publish:
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          pattern: tent-wheel-*
+          merge-multiple: true
+
+      - name: Create release and upload wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag != '' && inputs.tag || format('v{0}', inputs.version) }}
+        run: |
+          ls -la wheels/
+          test "$(find wheels -name '*.whl' | wc -l)" -ge 1 || {
+            echo "::error::no wheels found"; exit 1; }
+
+          cd wheels
+          sha256sum ./*.whl | sed 's| \./| |' > SHA256SUMS
+
+          notes=$(mktemp)
+          cat > "$notes" <<EOF
+          TENT-enabled (\`-DUSE_TENT=ON\`) CUDA wheels built from the \`tent-wheels\`
+          branch with the official cuda:x86_64 wheel profile (manylinux2_28 + CUDA 12.8
+          image, auditwheel-repaired, TENT runtime bundled). Requires an NVIDIA driver on
+          the host. Usage: \`pip install <wheel>\`, then \`MC_USE_TENT=1\` and pass
+          \`P2PHANDSHAKE\` as the metadata argument for P2P metadata.
+
+          Build log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading with --clobber"
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "mooncake-transfer-engine ${{ inputs.version }} (TENT + CUDA)" \
+              --notes-file "$notes" --latest
+          fi
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" ./*.whl SHA256SUMS --clobber
+          echo "Published: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
