@@ -35,6 +35,12 @@ on:
         # false until TENT is validated on arm64.
         type: boolean
         default: false
+      ha-backend:
+        # etcd (default, matches official wheels) | k8s (K8s Lease leader
+        # election HA backend; mutually exclusive with the Go etcd wrappers,
+        # so etcd is flipped OFF and STORE_USE_K8S_LEASE is enabled)
+        type: string
+        default: etcd
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -116,6 +122,15 @@ jobs:
           # so the wheel only needs the headers (fetched below) and still
           # imports on hosts without libfabric.
           cmake_args="$cmake_args -DUSE_EFA=ON -DLIBFABRIC_INCLUDE_DIR=$RUNNER_TEMP/libfabric-headers/include"
+
+          # HA backend: 'k8s' swaps the etcd HA backend for K8s Lease leader
+          # election. CMake forbids the Go etcd wrapper and the Go k8s-lease
+          # wrapper in the same process, so etcd flags flip OFF here.
+          if [ "${{ inputs.ha-backend }}" = "k8s" ]; then
+            cmake_args="${cmake_args//-DUSE_ETCD=ON/-DUSE_ETCD=OFF}"
+            cmake_args="${cmake_args//-DSTORE_USE_ETCD=ON/-DSTORE_USE_ETCD=OFF}"
+            cmake_args="$cmake_args -DSTORE_USE_K8S_LEASE=ON"
+          fi
 
           # TENT runtime (off unless activated via MC_USE_TENT=1 at runtime).
           # liburing is provided by dependencies.sh / mooncake_provide_liburing().
