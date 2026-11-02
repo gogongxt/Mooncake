@@ -92,7 +92,7 @@ jobs:
           pattern: tent-k8s-*
           merge-multiple: true
 
-      - name: Verify wheel contents (k8s in, etcd out)
+      - name: Verify wheel contents (k8s + TENT in, etcd out)
         run: |
           set -eu
           shopt -s nullglob
@@ -101,6 +101,10 @@ jobs:
           for w in "${wheels[@]}"; do
             if ! unzip -l "$w" | grep -q 'libk8s_lease_wrapper.so'; then
               echo "::error::$w does not contain libk8s_lease_wrapper.so"
+              exit 1
+            fi
+            if ! unzip -l "$w" | grep -q 'libtent_metrics'; then
+              echo "::error::$w does not contain the TENT runtime (libtent_metrics)"
               exit 1
             fi
             if unzip -l "$w" | grep -q 'libetcd_wrapper.so'; then
