@@ -12,6 +12,9 @@ name: build-wheel-tent-k8s
 #     uses --ha_backend_type=k8s, metadata needs HTTP/P2P handshake.
 
 on:
+  push:
+    tags:
+      - 'v*-tent-k8s'
   workflow_dispatch:
     inputs:
       version:
@@ -29,33 +32,55 @@ on:
         default: true
 
 jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      python-versions: ${{ steps.v.outputs.python-versions }}
+    steps:
+      - name: Derive wheel version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ inputs.version }}"
+            pys='${{ inputs.python-versions }}'
+          else
+            v="${GITHUB_REF_NAME#v}"   # v0.3.14rc3.post1-tent-k8s -> ...
+            v="${v%-tent-k8s}"          # ... 0.3.14rc3.post1
+            pys='["3.10", "3.11", "3.12", "3.13", "3.14"]'
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "python-versions=$pys" >> "$GITHUB_OUTPUT"
+
   build-cuda:
     name: cuda (CUDA 12.8) + TENT + k8s
+    needs: prepare
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       variant: cuda
       architecture: x86_64
-      python-versions: ${{ inputs.python-versions }}
+      python-versions: ${{ needs.prepare.outputs.python-versions }}
       artifact-prefix: tent-k8s-cuda
-      version-override: ${{ inputs.version }}
+      version-override: ${{ needs.prepare.outputs.version }}
       use-tent: true
       ha-backend: k8s
 
   build-cuda13:
     name: cuda13 (CUDA 13.0) + TENT + k8s
+    needs: prepare
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       variant: cuda13
       architecture: x86_64
-      python-versions: ${{ inputs.python-versions }}
+      python-versions: ${{ needs.prepare.outputs.python-versions }}
       artifact-prefix: tent-k8s-cuda13
-      version-override: ${{ inputs.version }}
+      version-override: ${{ needs.prepare.outputs.version }}
       use-tent: true
       ha-backend: k8s
 
   release:
-    if: ${{ inputs.create-release }}
-    needs: [build-cuda, build-cuda13]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.create-release }}
+    needs: [prepare, build-cuda, build-cuda13]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -95,12 +120,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v${{ inputs.version }}-tent-k8s"
+          tag="v${{ needs.prepare.outputs.version }}-tent-k8s"
           gh release create "$tag" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --prerelease \
-            --title "Mooncake ${{ inputs.version }} TENT + K8s Lease HA (CUDA 12.8 / CUDA 13.0)" \
+            --title "Mooncake ${{ needs.prepare.outputs.version }} TENT + K8s Lease HA (CUDA 12.8 / CUDA 13.0)" \
             --notes "Fork build based on upstream v0.3.14-pre-3 (f3d81669).
 
           - TENT runtime enabled (inactive until MC_USE_TENT=1)
