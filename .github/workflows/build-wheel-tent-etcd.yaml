@@ -1,0 +1,141 @@
+name: build-wheel-tent-etcd
+
+# Fork-only workflow: builds x86_64 wheels with the TENT runtime on top of the
+# stock v0.3.14 cuda / cuda13 profiles. Those profiles already compile the etcd
+# HA backend (USE_ETCD=ON + STORE_USE_ETCD=ON), so this only adds USE_TENT=ON.
+#
+# Product: mooncake_transfer_engine (CUDA 12.8) and
+#          mooncake_transfer_engine_cuda13 (CUDA 13.0), CPython 3.10-3.14,
+#          manylinux_2_28 x86_64, TENT + etcd HA (+ etcd TLS via
+#          MOONCAKE_ETCD_CA_CERT / *_CLIENT_CERT / *_CLIENT_KEY / *_SERVER_NAME).
+#
+# Runtime notes:
+#   - TENT ships in the wheel but stays dormant until MC_USE_TENT=1.
+#   - No k8s Lease backend in this build (mutually exclusive with the Go etcd
+#     wrapper at compile time).
+
+on:
+  push:
+    tags:
+      - 'v*-tent-etcd'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Wheel version (PEP 440), also names the release tag'
+        required: true
+        default: '0.3.14.post1'
+      python-versions:
+        description: 'JSON list of Python versions'
+        required: false
+        default: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
+      create-release:
+        description: 'Create the GitHub release when builds pass'
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      python-versions: ${{ steps.v.outputs.python-versions }}
+    steps:
+      - name: Derive wheel version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ inputs.version }}"
+            pys='${{ inputs.python-versions }}'
+          else
+            v="${GITHUB_REF_NAME#v}"   # v0.3.14.post1-tent-etcd -> ...
+            v="${v%-tent-etcd}"         # ... 0.3.14.post1
+            pys='["3.10", "3.11", "3.12", "3.13", "3.14"]'
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "python-versions=$pys" >> "$GITHUB_OUTPUT"
+
+  build-cuda:
+    name: cuda (CUDA 12.8) + TENT + etcd
+    needs: prepare
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda
+      architecture: x86_64
+      python-versions: ${{ needs.prepare.outputs.python-versions }}
+      artifact-prefix: tent-etcd-cuda
+      version-override: ${{ needs.prepare.outputs.version }}
+      use-tent: true
+
+  build-cuda13:
+    name: cuda13 (CUDA 13.0) + TENT + etcd
+    needs: prepare
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: x86_64
+      python-versions: ${{ needs.prepare.outputs.python-versions }}
+      artifact-prefix: tent-etcd-cuda13
+      version-override: ${{ needs.prepare.outputs.version }}
+      use-tent: true
+
+  release:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.create-release }}
+    needs: [prepare, build-cuda, build-cuda13]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tent-etcd-*
+          merge-multiple: true
+
+      - name: Verify wheel contents (etcd + TENT in, k8s out)
+        run: |
+          set -eu
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          [ "${#wheels[@]}" -gt 0 ] || { echo "::error::no wheels downloaded"; exit 1; }
+          for w in "${wheels[@]}"; do
+            if ! unzip -l "$w" | grep -q 'libetcd_wrapper.so'; then
+              echo "::error::$w does not contain libetcd_wrapper.so"
+              exit 1
+            fi
+            if ! unzip -l "$w" | grep -q 'libtent_metrics'; then
+              echo "::error::$w does not contain the TENT runtime (libtent_metrics)"
+              exit 1
+            fi
+            if unzip -l "$w" | grep -q 'libk8s_lease_wrapper.so'; then
+              echo "::error::$w unexpectedly contains libk8s_lease_wrapper.so"
+              exit 1
+            fi
+            echo "OK: $w"
+          done
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum *.whl > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ needs.prepare.outputs.version }}-tent-etcd"
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Mooncake ${{ needs.prepare.outputs.version }} TENT + etcd HA (CUDA 12.8 / CUDA 13.0)" \
+            --notes "Fork build based on the official v0.3.14 release (e1ea5d31).
+
+          - TENT runtime enabled (inactive until MC_USE_TENT=1)
+          - etcd HA backend compiled in (stock v0.3.14 cuda profiles): run master with --ha_backend_type=etcd, clients with etcd://...
+          - etcd TLS/mTLS supported via MOONCAKE_ETCD_CA_CERT / MOONCAKE_ETCD_CLIENT_CERT / MOONCAKE_ETCD_CLIENT_KEY / MOONCAKE_ETCD_SERVER_NAME (PR #4945); endpoints must use https:// when TLS is configured
+          - K8s Lease HA backend NOT compiled in (mutually exclusive with the Go etcd wrapper)
+          - Variants: mooncake_transfer_engine (CUDA 12.8) and mooncake_transfer_engine_cuda13 (CUDA 13.0), CPython 3.10-3.14, manylinux_2_28 x86_64" \
+          || gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
